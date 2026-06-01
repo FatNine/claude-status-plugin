@@ -7,7 +7,7 @@ use std::os::unix::process::{parent_id, CommandExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -17,6 +17,13 @@ unsafe extern "C" {
 
 const NOTIFICATION_NAME: &str = "com.poisonpenllc.Claude-Status.session-changed";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long an `active` session may sit with no transcript progress while
+/// awaiting a response (thinking / streaming) before it's treated as stalled
+/// and dropped to idle. Tool execution (Bash, subagent, mcp, …) is exempt — it
+/// can legitimately run far longer — so only "awaiting response" states time
+/// out. Generous enough not to trip on a slow turn that hasn't flushed a line.
+const STALE_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Shared utilities (matching set-session-name)
@@ -185,6 +192,16 @@ impl DaemonState {
             session_name: None,
             compacting: false,
         }
+    }
+
+    /// True when the session is active and waiting on a model response
+    /// (thinking or streaming) with no tools or subagents in flight. This is the
+    /// only situation the stall timeout applies to — tool execution can take
+    /// arbitrarily long and must not be treated as stalled.
+    fn is_awaiting_response(&self) -> bool {
+        self.state == SessionState::Active
+            && self.active_agents.is_empty()
+            && (self.activity == "thinking" || self.activity.is_empty())
     }
 
     /// Process a JSONL line and return true if state changed.
@@ -790,6 +807,15 @@ fn daemon_mode(args: &[String]) -> Result<(), String> {
     write_status(&ctx, &state);
     post_darwin_notification();
 
+    // Tracks the last time the transcript made progress, for stall detection.
+    let mut last_event = Instant::now();
+    // Stall timeout; overridable via env (mainly for testing) else STALE_TIMEOUT.
+    let stale_timeout = env::var("CLAUDE_STATUS_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(STALE_TIMEOUT);
+
     // Enter poll loop
     loop {
         thread::sleep(POLL_INTERVAL);
@@ -840,6 +866,17 @@ fn daemon_mode(args: &[String]) -> Result<(), String> {
         }
 
         if changed {
+            last_event = Instant::now();
+            write_status(&ctx, &state);
+            post_darwin_notification();
+        } else if state.is_awaiting_response() && last_event.elapsed() >= stale_timeout {
+            // Active and awaiting a response, but the transcript hasn't advanced
+            // for a long time — the turn stalled or is quietly waiting. Drop to
+            // idle so the UI stops showing a misleading "working". If the session
+            // resumes, the next transcript line moves it back to active.
+            state.state = SessionState::Idle;
+            state.activity.clear();
+            state.event = "stale".to_string();
             write_status(&ctx, &state);
             post_darwin_notification();
         }
@@ -1115,6 +1152,29 @@ mod tests {
         s.process_line(&make_user_text("hello"));
         assert_eq!(s.state, SessionState::Active);
         assert_eq!(s.activity, "thinking");
+    }
+
+    #[test]
+    fn awaiting_response_eligibility() {
+        let mut s = DaemonState::new();
+        // active + thinking → eligible for the stall timeout
+        s.state = SessionState::Active;
+        s.activity = "thinking".to_string();
+        assert!(s.is_awaiting_response());
+        // active + streaming (empty activity) → eligible
+        s.activity = String::new();
+        assert!(s.is_awaiting_response());
+        // active + a tool → NOT eligible (tools can run long)
+        s.activity = "Bash".to_string();
+        assert!(!s.is_awaiting_response());
+        // active + thinking but a subagent is in flight → NOT eligible
+        s.activity = "thinking".to_string();
+        s.active_agents.insert("tool-1".to_string());
+        assert!(!s.is_awaiting_response());
+        // not active → NOT eligible
+        s.active_agents.clear();
+        s.state = SessionState::Idle;
+        assert!(!s.is_awaiting_response());
     }
 
     #[test]
