@@ -562,6 +562,37 @@ impl DaemonState {
 }
 
 // ---------------------------------------------------------------------------
+// Hook mode: ensure a daemon is tracking this session
+// ---------------------------------------------------------------------------
+
+/// Ensures a daemon is tracking the session referenced by the hook input.
+///
+/// Claude Code 2.1.x pre-forks "spare" worker sessions that each fire
+/// SessionStart, but the real interactive conversation resumes under a new
+/// session id without re-firing SessionStart — so it never gets a daemon and
+/// the menu bar can't see it. Conversation-level hooks (UserPromptSubmit) do
+/// fire for the real session with its real transcript path, so we use them to
+/// start a daemon on demand. If one is already running we do nothing, so we
+/// never clobber the live state it's maintaining.
+fn hook_ensure_daemon(input: &Value) -> Result<(), String> {
+    let transcript_path = input
+        .get("transcript_path")
+        .and_then(|s| s.as_str())
+        .ok_or("missing transcript_path")?;
+
+    let cpid_path = transcript_sibling(transcript_path, "cpid");
+    if let Ok(pid_str) = fs::read_to_string(&cpid_path) {
+        if let Ok(daemon_pid) = pid_str.trim().parse::<u32>() {
+            if pid_is_alive(daemon_pid) {
+                return Ok(()); // already tracked — leave its state alone
+            }
+        }
+    }
+    // No live daemon for this transcript yet — start one.
+    hook_session_start(input)
+}
+
+// ---------------------------------------------------------------------------
 // Hook mode: SessionStart
 // ---------------------------------------------------------------------------
 
@@ -1005,6 +1036,9 @@ fn run() -> Result<(), String> {
 
     match hook_event {
         "SessionStart" => hook_session_start(&input),
+        // Conversation-level events fire for the real (possibly resumed) session,
+        // so use them to ensure a daemon is tracking it.
+        "UserPromptSubmit" | "Stop" => hook_ensure_daemon(&input),
         "SessionEnd" => hook_session_end(&input),
         _ => Ok(()), // Unknown hook event in hook mode — ignore
     }
