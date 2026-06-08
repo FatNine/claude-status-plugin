@@ -426,8 +426,22 @@ impl DaemonState {
             self.active_agents.clear();
             self.state = SessionState::Active;
             self.activity = "thinking".to_string();
+        } else if has_tool_result && self.is_input_blocking_activity() {
+            // The tool that was blocking on user input (AskUserQuestion, plan
+            // approval) just returned — the user answered. Resume "working" now
+            // instead of holding the blocking activity until the turn ends.
+            self.state = SessionState::Active;
+            self.activity.clear();
         }
-        // tool_result-only messages don't change state (the assistant response will)
+        // Other tool_result-only messages don't change state (the assistant
+        // response will).
+    }
+
+    /// True when the current activity is a tool that blocks on user input.
+    /// The app surfaces these as a hard block, so clearing them on answer lets
+    /// the light switch back to "working" immediately.
+    fn is_input_blocking_activity(&self) -> bool {
+        self.activity == "AskUserQuestion" || self.activity == "ExitPlanMode"
     }
 
     fn process_progress(&mut self, v: &Value) {
@@ -1186,6 +1200,23 @@ mod tests {
         s.process_line(&make_user_text("hello"));
         assert_eq!(s.state, SessionState::Active);
         assert_eq!(s.activity, "thinking");
+    }
+
+    #[test]
+    fn answering_ask_user_question_resumes_working() {
+        let mut s = DaemonState::new();
+        // Assistant asks via the AskUserQuestion tool.
+        s.process_line(&make_assistant_tool_use("AskUserQuestion", "q1"));
+        assert_eq!(s.activity, "AskUserQuestion");
+        // User answers (tool_result) → should clear the blocking activity.
+        let answer = serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "q1"}]}
+        })
+        .to_string();
+        s.process_line(&answer);
+        assert_eq!(s.state, SessionState::Active);
+        assert_eq!(s.activity, "");
     }
 
     #[test]
